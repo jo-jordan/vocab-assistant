@@ -18,6 +18,74 @@ pub fn run(init: std.process.Init) !void {
     var store: models.VocabularyStore = try vocab_loader.loadVocabFromFile(arena, io, vocab_path);
     defer store.deinit();
 
-    try vocab_loader.writeStoreToWriter(writer, &store);
+    try runQuiz(io, writer, &store);
     try writer.flush();
+}
+
+fn runQuiz(io: Io, writer: *Io.Writer, store: *const models.VocabularyStore) !void {
+    var stdin_buffer: [256]u8 = undefined;
+    var stdin_reader = Io.File.stdin().readerStreaming(io, &stdin_buffer);
+    const reader = &stdin_reader.interface;
+
+    try writer.writeAll("Type `exit` or `quit` to stop.\n\n");
+
+    while (true) {
+        const prompt = try chooseRandomEntry(io, store);
+
+        try writer.print("Date: {s}\n", .{prompt.date});
+        try writer.print("Word: {s}\n", .{prompt.entry.word});
+        try writer.writeAll("Pronunciation: ");
+        try writer.flush();
+
+        const input = (try reader.takeDelimiter('\n')) orelse {
+            try writer.writeAll("\nSession ended.\n");
+            return;
+        };
+        const answer = std.mem.trim(u8, input, " \t\r");
+
+        if (std.mem.eql(u8, answer, "exit") or std.mem.eql(u8, answer, "quit")) {
+            try writer.writeAll("Session ended.\n");
+            return;
+        }
+
+        if (std.mem.eql(u8, answer, prompt.entry.pronunciation)) {
+            try writer.writeAll("Correct!\n\n");
+            continue;
+        }
+
+        try writer.print("Expected: {s}\n\n", .{prompt.entry.pronunciation});
+    }
+}
+
+fn chooseRandomEntry(io: Io, store: *const models.VocabularyStore) !struct {
+    date: []const u8,
+    entry: models.Vocab,
+} {
+    const dates = store.by_date.keys();
+    const entry_lists = store.by_date.values();
+
+    var total_entries: usize = 0;
+    for (entry_lists) |entries| {
+        total_entries += entries.items.len;
+    }
+
+    if (total_entries == 0) {
+        return error.EmptyVocabularyStore;
+    }
+
+    const random_source: std.Random.IoSource = .{ .io = io };
+    const random = random_source.interface();
+    var target_index = random.uintLessThan(usize, total_entries);
+
+    for (dates, entry_lists) |date, entries| {
+        if (target_index < entries.items.len) {
+            return .{
+                .date = date,
+                .entry = entries.items[target_index],
+            };
+        }
+        target_index -= entries.items.len;
+    }
+
+    unreachable;
 }
