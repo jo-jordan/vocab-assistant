@@ -1,0 +1,14 @@
+.{
+    .name = .vocab_assistant,
+    .version = "0.1.0",
+    .fingerprint = 0x4dc53ad2a9edb875,
+    .minimum_zig_version = "0.16.0-dev.2905+5d71e3051",
+    .dependencies = .{},
+    .paths = .{
+        "README.md",
+        "build.zig",
+        "build.zig.zon",
+        "data",
+        "src",
+    },
+}
