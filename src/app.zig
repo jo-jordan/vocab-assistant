@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const vocab_loader = @import("vocab_loader.zig");
+const models = @import("models/vocab.zig");
 
 pub const default_vocab_path = "data/vocab.md";
 
@@ -14,6 +15,9 @@ pub fn run(init: std.process.Init) !void {
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const writer = &stdout_writer.interface;
 
-    try vocab_loader.writeFileToWriter(io, writer, vocab_path);
+    var store: models.VocabularyStore = try vocab_loader.loadVocabFromFile(arena, io, vocab_path);
+    defer store.deinit();
+
+    try vocab_loader.writeStoreToWriter(writer, &store);
     try writer.flush();
 }
