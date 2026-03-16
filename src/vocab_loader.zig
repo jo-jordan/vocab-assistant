@@ -1,5 +1,5 @@
 const std = @import("std");
-const models = @import("models/vocab.zig");
+const models = @import("models/root.zig");
 
 pub fn loadVocabFromFile(
     allocator: std.mem.Allocator,
