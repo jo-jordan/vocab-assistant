@@ -2,3 +2,6 @@
 zig-out/
 *.o
 .DS_Store
+
+data/*.db-shm
+data/*.db-wal

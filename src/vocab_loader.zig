@@ -1,112 +1,154 @@
 const std = @import("std");
 const models = @import("models/root.zig");
 
-pub fn loadVocabFromFile(
+const c = @cImport({
+    @cInclude("sqlite3.h");
+});
+
+pub fn openDatabase(allocator: std.mem.Allocator, path: []const u8) !*c.sqlite3 {
+    const db_path = try allocator.dupeZ(u8, path);
+    defer allocator.free(db_path);
+
+    var db: ?*c.sqlite3 = null;
+    const rc = c.sqlite3_open_v2(
+        db_path.ptr,
+        &db,
+        c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE,
+        null,
+    );
+    try checkResult(rc, db);
+    errdefer _ = c.sqlite3_close(db);
+
+    try ensureSchema(db.?);
+    return db.?;
+}
+
+pub fn closeDatabase(db: *c.sqlite3) void {
+    _ = c.sqlite3_close(db);
+}
+
+pub fn loadVocabFromDatabase(
     allocator: std.mem.Allocator,
-    io: std.Io,
-    path: []const u8,
+    db: *c.sqlite3,
 ) !models.VocabularyStore {
     var store = models.VocabularyStore.init(allocator);
     errdefer store.deinit();
 
-    const cwd = std.Io.Dir.cwd();
-    const file = try cwd.openFile(io, path, .{ .mode = .read_only });
-    defer _ = file.close(io);
+    const sql =
+        \\SELECT word, meaning_cn, pronunciation
+        \\FROM vocab
+        \\ORDER BY rowid ASC;
+    ;
 
-    var buffer: [256]u8 = undefined;
-    var file_reader = file.readerStreaming(io, &buffer);
-    const reader = &file_reader.interface;
-    var current_date: ?[]const u8 = null;
+    var statement: ?*c.sqlite3_stmt = null;
+    try checkResult(c.sqlite3_prepare_v2(db, sql, -1, &statement, null), db);
+    defer _ = c.sqlite3_finalize(statement);
 
-    while (try reader.takeDelimiter('\n')) |line| {
-        try parseLine(allocator, std.mem.trimEnd(u8, line, "\r"), &store, &current_date);
-    }
+    while (true) {
+        const rc = c.sqlite3_step(statement);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) try checkResult(rc, db);
 
-    if (reader.bufferedLen() > 0) {
-        const trailing_line = try reader.peek(reader.bufferedLen());
-        try parseLine(allocator, std.mem.trimEnd(u8, trailing_line, "\r"), &store, &current_date);
+        try store.append(.{
+            .word = try duplicateColumnText(allocator, statement.?, 0),
+            .meaning_cn = try duplicateColumnText(allocator, statement.?, 1),
+            .pronunciation = try duplicateColumnText(allocator, statement.?, 2),
+        });
     }
 
     return store;
 }
 
-pub fn writeStoreToWriter(writer: *std.Io.Writer, store: *const models.VocabularyStore) !void {
-    const dates = store.by_date.keys();
-    const entry_lists = store.by_date.values();
+pub fn insertVocab(db: *c.sqlite3, entry: models.Vocab) !void {
+    const sql =
+        \\INSERT OR IGNORE INTO vocab (word, meaning_cn, pronunciation)
+        \\VALUES (?1, ?2, ?3);
+    ;
 
-    for (dates, entry_lists, 0..) |date, entries, index| {
-        if (index > 0) {
-            try writer.writeAll("\n");
+    var statement: ?*c.sqlite3_stmt = null;
+    try checkResult(c.sqlite3_prepare_v2(db, sql, -1, &statement, null), db);
+    defer _ = c.sqlite3_finalize(statement);
+
+    try bindText(statement.?, 1, entry.word);
+    try bindText(statement.?, 2, entry.meaning_cn);
+    try bindText(statement.?, 3, entry.pronunciation);
+
+    const rc = c.sqlite3_step(statement);
+    if (rc != c.SQLITE_DONE) try checkResult(rc, db);
+}
+
+fn ensureSchema(db: *c.sqlite3) !void {
+    if (try columnExists(db, "vocab", "prounonciation") and !(try columnExists(db, "vocab", "pronunciation"))) {
+        try checkResult(
+            c.sqlite3_exec(db, "ALTER TABLE vocab RENAME COLUMN prounonciation TO pronunciation;", null, null, null),
+            db,
+        );
+    }
+
+    const sql =
+        \\CREATE TABLE IF NOT EXISTS vocab (
+        \\    word TEXT NOT NULL,
+        \\    meaning_cn TEXT NOT NULL,
+        \\    pronunciation TEXT NOT NULL
+        \\);
+        \\CREATE UNIQUE INDEX IF NOT EXISTS idx_vocab_unique
+        \\ON vocab (word, meaning_cn, pronunciation);
+    ;
+
+    try checkResult(c.sqlite3_exec(db, sql, null, null, null), db);
+}
+
+fn columnExists(db: *c.sqlite3, table_name: []const u8, column_name: []const u8) !bool {
+    if (!std.mem.eql(u8, table_name, "vocab")) return false;
+
+    const pragma = "PRAGMA table_info(vocab);";
+    var statement: ?*c.sqlite3_stmt = null;
+    defer {
+        if (statement) |stmt| {
+            _ = c.sqlite3_finalize(stmt);
         }
+    }
+    try checkResult(c.sqlite3_prepare_v2(db, pragma, -1, &statement, null), db);
 
-        try writer.print("# {s}\n\n", .{date});
-        for (entries.items) |entry| {
-            try writer.print("- {s}｜{s}\n", .{ entry.word, entry.pronunciation });
+    while (true) {
+        const rc = c.sqlite3_step(statement);
+        if (rc == c.SQLITE_DONE) return false;
+        if (rc != c.SQLITE_ROW) try checkResult(rc, db);
+
+        const current_name = c.sqlite3_column_text(statement.?, 1) orelse continue;
+        const current_len: usize = @intCast(c.sqlite3_column_bytes(statement.?, 1));
+        if (std.mem.eql(u8, current_name[0..current_len], column_name)) {
+            return true;
         }
     }
 }
 
-fn parseLine(
-    allocator: std.mem.Allocator,
-    line: []const u8,
-    store: *models.VocabularyStore,
-    current_date: *?[]const u8,
-) !void {
-    const trimmed = std.mem.trim(u8, line, " \t");
-    if (trimmed.len == 0) return;
-
-    if (std.mem.startsWith(u8, trimmed, "# ")) {
-        current_date.* = try store.ensureDate(trimmed[2..]);
-        return;
-    }
-
-    if (!std.mem.startsWith(u8, trimmed, "- ")) return;
-    const date = current_date.* orelse return error.MissingDateHeader;
-    const entry = try parseEntry(allocator, trimmed[2..]);
-    errdefer entry.deinit(allocator);
-    try store.append(date, entry);
-}
-
-fn parseEntry(allocator: std.mem.Allocator, line: []const u8) !models.Vocab {
-    const separator = std.mem.indexOf(u8, line, "｜") orelse return error.InvalidVocabLine;
-    const word = std.mem.trim(u8, line[0..separator], " \t");
-    const pronunciation = std.mem.trim(u8, line[separator + "｜".len ..], " \t");
-
-    if (word.len == 0 or pronunciation.len == 0) {
-        return error.InvalidVocabLine;
-    }
-
-    return .{
-        .word = try allocator.dupe(u8, word),
-        .pronunciation = try allocator.dupe(u8, pronunciation),
-    };
-}
-
-test "loads vocab entries into memory by date" {
-    const allocator = std.testing.allocator;
-    var store = models.VocabularyStore.init(allocator);
-    defer store.deinit();
-
-    var current_date: ?[]const u8 = null;
-    try parseLine(allocator, "# 2026-03-12", &store, &current_date);
-    try parseLine(allocator, "- 立ち入り｜たちいり", &store, &current_date);
-    try parseLine(allocator, "- 宣告｜せんこく", &store, &current_date);
-
-    try std.testing.expectEqual(@as(usize, 1), store.by_date.count());
-    const entries = store.by_date.get("2026-03-12").?;
-    try std.testing.expectEqual(@as(usize, 2), entries.items.len);
-    try std.testing.expectEqualStrings("立ち入り", entries.items[0].word);
-    try std.testing.expectEqualStrings("せんこく", entries.items[1].pronunciation);
-}
-
-test "rejects vocab entries before a date header" {
-    const allocator = std.testing.allocator;
-    var store = models.VocabularyStore.init(allocator);
-    defer store.deinit();
-
-    var current_date: ?[]const u8 = null;
-    try std.testing.expectError(
-        error.MissingDateHeader,
-        parseLine(allocator, "- 立ち入り｜たちいり", &store, &current_date),
+fn bindText(statement: *c.sqlite3_stmt, index: c_int, value: []const u8) !void {
+    const rc = c.sqlite3_bind_text(
+        statement,
+        index,
+        value.ptr,
+        @intCast(value.len),
+        null,
     );
+    if (rc != c.SQLITE_OK) return error.SqliteBindFailed;
+}
+
+fn duplicateColumnText(
+    allocator: std.mem.Allocator,
+    statement: *c.sqlite3_stmt,
+    column_index: c_int,
+) ![]const u8 {
+    const text_ptr = c.sqlite3_column_text(statement, column_index) orelse return error.NullColumnValue;
+    const length: usize = @intCast(c.sqlite3_column_bytes(statement, column_index));
+    return allocator.dupe(u8, text_ptr[0..length]);
+}
+
+fn checkResult(rc: c_int, db: ?*c.sqlite3) !void {
+    if (rc == c.SQLITE_OK or rc == c.SQLITE_DONE or rc == c.SQLITE_ROW) return;
+
+    if (db) |database| {
+        std.log.err("sqlite error: {s}", .{c.sqlite3_errmsg(database)});
+    }
+    return error.SqliteFailure;
 }

@@ -15,11 +15,13 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{
                 .{ .name = "vocab_assistant", .module = vocab_assistant },
             },
         }),
     });
+    exe.root_module.linkSystemLibrary("sqlite3", .{});
 
     b.installArtifact(exe);
 
@@ -35,11 +37,14 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{
         .root_module = vocab_assistant,
     });
+    lib_tests.root_module.link_libc = true;
+    lib_tests.root_module.linkSystemLibrary("sqlite3", .{});
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    exe_tests.root_module.linkSystemLibrary("sqlite3", .{});
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const test_step = b.step("test", "Run project tests");
