@@ -35,7 +35,9 @@ pub fn loadVocabFromDatabase(
     errdefer store.deinit();
 
     const sql =
-        \\SELECT word, meaning_cn, pronunciation
+        \\SELECT rowid, word, meaning_cn, pronunciation,
+        \\       review_streak, total_reviews, correct_reviews,
+        \\       interval_seconds, next_review_at, last_reviewed_at
         \\FROM vocab
         \\ORDER BY rowid ASC;
     ;
@@ -50,9 +52,16 @@ pub fn loadVocabFromDatabase(
         if (rc != c.SQLITE_ROW) try checkResult(rc, db);
 
         try store.append(.{
-            .word = try duplicateColumnText(allocator, statement.?, 0),
-            .meaning_cn = try duplicateColumnText(allocator, statement.?, 1),
-            .pronunciation = try duplicateColumnText(allocator, statement.?, 2),
+            .id = c.sqlite3_column_int64(statement.?, 0),
+            .word = try duplicateColumnText(allocator, statement.?, 1),
+            .meaning_cn = try duplicateColumnText(allocator, statement.?, 2),
+            .pronunciation = try duplicateColumnText(allocator, statement.?, 3),
+            .review_streak = @intCast(c.sqlite3_column_int(statement.?, 4)),
+            .total_reviews = @intCast(c.sqlite3_column_int(statement.?, 5)),
+            .correct_reviews = @intCast(c.sqlite3_column_int(statement.?, 6)),
+            .interval_seconds = c.sqlite3_column_int64(statement.?, 7),
+            .next_review_at = c.sqlite3_column_int64(statement.?, 8),
+            .last_reviewed_at = c.sqlite3_column_int64(statement.?, 9),
         });
     }
 
@@ -61,8 +70,12 @@ pub fn loadVocabFromDatabase(
 
 pub fn insertVocab(db: *c.sqlite3, entry: models.Vocab) !void {
     const sql =
-        \\INSERT OR IGNORE INTO vocab (word, meaning_cn, pronunciation)
-        \\VALUES (?1, ?2, ?3);
+        \\INSERT OR IGNORE INTO vocab (
+        \\    word, meaning_cn, pronunciation,
+        \\    review_streak, total_reviews, correct_reviews,
+        \\    interval_seconds, next_review_at, last_reviewed_at
+        \\)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);
     ;
 
     var statement: ?*c.sqlite3_stmt = null;
@@ -72,6 +85,40 @@ pub fn insertVocab(db: *c.sqlite3, entry: models.Vocab) !void {
     try bindText(statement.?, 1, entry.word);
     try bindText(statement.?, 2, entry.meaning_cn);
     try bindText(statement.?, 3, entry.pronunciation);
+    try bindInt64(statement.?, 4, entry.review_streak);
+    try bindInt64(statement.?, 5, entry.total_reviews);
+    try bindInt64(statement.?, 6, entry.correct_reviews);
+    try bindInt64(statement.?, 7, entry.interval_seconds);
+    try bindInt64(statement.?, 8, entry.next_review_at);
+    try bindInt64(statement.?, 9, entry.last_reviewed_at);
+
+    const rc = c.sqlite3_step(statement);
+    if (rc != c.SQLITE_DONE) try checkResult(rc, db);
+}
+
+pub fn updateReviewState(db: *c.sqlite3, entry: models.Vocab) !void {
+    const sql =
+        \\UPDATE vocab
+        \\SET review_streak = ?1,
+        \\    total_reviews = ?2,
+        \\    correct_reviews = ?3,
+        \\    interval_seconds = ?4,
+        \\    next_review_at = ?5,
+        \\    last_reviewed_at = ?6
+        \\WHERE rowid = ?7;
+    ;
+
+    var statement: ?*c.sqlite3_stmt = null;
+    try checkResult(c.sqlite3_prepare_v2(db, sql, -1, &statement, null), db);
+    defer _ = c.sqlite3_finalize(statement);
+
+    try bindInt64(statement.?, 1, entry.review_streak);
+    try bindInt64(statement.?, 2, entry.total_reviews);
+    try bindInt64(statement.?, 3, entry.correct_reviews);
+    try bindInt64(statement.?, 4, entry.interval_seconds);
+    try bindInt64(statement.?, 5, entry.next_review_at);
+    try bindInt64(statement.?, 6, entry.last_reviewed_at);
+    try bindInt64(statement.?, 7, entry.id);
 
     const rc = c.sqlite3_step(statement);
     if (rc != c.SQLITE_DONE) try checkResult(rc, db);
@@ -89,13 +136,38 @@ fn ensureSchema(db: *c.sqlite3) !void {
         \\CREATE TABLE IF NOT EXISTS vocab (
         \\    word TEXT NOT NULL,
         \\    meaning_cn TEXT NOT NULL,
-        \\    pronunciation TEXT NOT NULL
+        \\    pronunciation TEXT NOT NULL,
+        \\    review_streak INTEGER NOT NULL DEFAULT 0,
+        \\    total_reviews INTEGER NOT NULL DEFAULT 0,
+        \\    correct_reviews INTEGER NOT NULL DEFAULT 0,
+        \\    interval_seconds INTEGER NOT NULL DEFAULT 0,
+        \\    next_review_at INTEGER NOT NULL DEFAULT 0,
+        \\    last_reviewed_at INTEGER NOT NULL DEFAULT 0
         \\);
         \\CREATE UNIQUE INDEX IF NOT EXISTS idx_vocab_unique
         \\ON vocab (word, meaning_cn, pronunciation);
     ;
 
     try checkResult(c.sqlite3_exec(db, sql, null, null, null), db);
+    try ensureColumn(db, "review_streak", "INTEGER NOT NULL DEFAULT 0");
+    try ensureColumn(db, "total_reviews", "INTEGER NOT NULL DEFAULT 0");
+    try ensureColumn(db, "correct_reviews", "INTEGER NOT NULL DEFAULT 0");
+    try ensureColumn(db, "interval_seconds", "INTEGER NOT NULL DEFAULT 0");
+    try ensureColumn(db, "next_review_at", "INTEGER NOT NULL DEFAULT 0");
+    try ensureColumn(db, "last_reviewed_at", "INTEGER NOT NULL DEFAULT 0");
+}
+
+fn ensureColumn(db: *c.sqlite3, column_name: []const u8, column_definition: []const u8) !void {
+    if (try columnExists(db, "vocab", column_name)) return;
+
+    var sql_buffer: [256]u8 = undefined;
+    const sql = try std.fmt.bufPrintZ(
+        &sql_buffer,
+        "ALTER TABLE vocab ADD COLUMN {s} {s};",
+        .{ column_name, column_definition },
+    );
+
+    try checkResult(c.sqlite3_exec(db, sql.ptr, null, null, null), db);
 }
 
 fn columnExists(db: *c.sqlite3, table_name: []const u8, column_name: []const u8) !bool {
@@ -131,6 +203,11 @@ fn bindText(statement: *c.sqlite3_stmt, index: c_int, value: []const u8) !void {
         @intCast(value.len),
         null,
     );
+    if (rc != c.SQLITE_OK) return error.SqliteBindFailed;
+}
+
+fn bindInt64(statement: *c.sqlite3_stmt, index: c_int, value: anytype) !void {
+    const rc = c.sqlite3_bind_int64(statement, index, @intCast(value));
     if (rc != c.SQLITE_OK) return error.SqliteBindFailed;
 }
 

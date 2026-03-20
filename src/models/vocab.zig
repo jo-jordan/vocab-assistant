@@ -1,14 +1,25 @@
 const std = @import("std");
 
 pub const Vocab = struct {
+    id: i64,
     word: []const u8,
     meaning_cn: []const u8,
     pronunciation: []const u8,
+    review_streak: u16,
+    total_reviews: u32,
+    correct_reviews: u32,
+    interval_seconds: i64,
+    next_review_at: i64,
+    last_reviewed_at: i64,
 
     pub fn deinit(self: Vocab, allocator: std.mem.Allocator) void {
         allocator.free(self.word);
         allocator.free(self.meaning_cn);
         allocator.free(self.pronunciation);
+    }
+
+    pub fn isDue(self: Vocab, now_ts: i64) bool {
+        return self.next_review_at <= now_ts;
     }
 };
 

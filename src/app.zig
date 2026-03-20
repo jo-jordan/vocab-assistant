@@ -40,7 +40,7 @@ pub fn run(init: std.process.Init) !void {
             var store = try vocab_loader.loadVocabFromDatabase(arena, db);
             defer store.deinit();
 
-            const summary = try runReviewMode(io, writer, reader, &store);
+            const summary = try runReviewMode(io, writer, reader, db, &store);
             try writer.print(
                 "Summary:\nTime Cost: {} sec\nAccuracy: {s}{}%{s}\n",
                 .{ summary.contTime, accuracyColor(summary.accuracy), summary.accuracy, ansi.reset },
@@ -71,7 +71,8 @@ fn runReviewMode(
     io: Io,
     writer: *Io.Writer,
     reader: *Io.Reader,
-    store: *const models.VocabularyStore,
+    db: anytype,
+    store: *models.VocabularyStore,
 ) !models.Summary {
     if (store.len() == 0) {
         try writer.writeAll("No vocab found. Switch to add mode first.\n");
@@ -84,7 +85,19 @@ fn runReviewMode(
     var correct_count: u16 = 0;
 
     while (true) {
-        const entry = chooseRandomEntry(io, store);
+        const now_ts = currentUnixSeconds(io);
+        const entry = chooseDueEntry(io, store, now_ts) orelse {
+            const next_ts = nextReviewAt(store) orelse {
+                try writer.writeAll("No more cards are available right now.\n");
+                break;
+            };
+            const wait_seconds = @max(next_ts - now_ts, 0);
+            try writer.print(
+                "No cards are due right now. Next review in about {} minute(s).\n",
+                .{@divTrunc(wait_seconds + 59, 60)},
+            );
+            break;
+        };
 
         try writer.print("Word: {s}\n", .{entry.word});
         try writer.print("Meaning (CN): {s}\n", .{entry.meaning_cn});
@@ -103,7 +116,11 @@ fn runReviewMode(
         }
 
         count += 1;
-        if (std.mem.eql(u8, answer, entry.pronunciation)) {
+        const was_correct = std.mem.eql(u8, answer, entry.pronunciation);
+        applyReviewResult(entry, was_correct, now_ts);
+        try vocab_loader.updateReviewState(db, entry.*);
+
+        if (was_correct) {
             correct_count += 1;
             try writer.print("{s}Correct!{s}\n\n", .{ ansi.green, ansi.reset });
             continue;
@@ -153,9 +170,16 @@ fn runAddMode(
         defer allocator.free(pronunciation);
 
         const entry = models.Vocab{
+            .id = 0,
             .word = try allocator.dupe(u8, word),
             .meaning_cn = try allocator.dupe(u8, meaning_cn),
             .pronunciation = try allocator.dupe(u8, pronunciation),
+            .review_streak = 0,
+            .total_reviews = 0,
+            .correct_reviews = 0,
+            .interval_seconds = 0,
+            .next_review_at = 0,
+            .last_reviewed_at = 0,
         };
         defer entry.deinit(allocator);
 
@@ -184,15 +208,87 @@ fn promptForOwnedField(
     return owned;
 }
 
-fn chooseRandomEntry(io: Io, store: *const models.VocabularyStore) models.Vocab {
+fn chooseDueEntry(io: Io, store: *models.VocabularyStore, now_ts: i64) ?*models.Vocab {
     const random_source: std.Random.IoSource = .{ .io = io };
     const random = random_source.interface();
-    const index = random.uintLessThan(usize, store.entries.items.len);
-    return store.entries.items[index];
+    var best_entry: ?*models.Vocab = null;
+    var best_score: i128 = std.math.minInt(i128);
+
+    for (store.entries.items) |*entry| {
+        if (!entry.isDue(now_ts)) continue;
+
+        const score = duePriorityScore(entry.*, now_ts) + @as(i128, random.uintLessThan(u16, 17));
+        if (best_entry == null or score > best_score) {
+            best_entry = entry;
+            best_score = score;
+        }
+    }
+
+    return best_entry;
 }
 
 fn accuracyColor(accuracy: u8) []const u8 {
     if (accuracy < 60) return ansi.red;
     if (accuracy < 80) return ansi.orange;
     return ansi.green;
+}
+
+fn currentUnixSeconds(io: Io) i64 {
+    return std.Io.Clock.real.now(io).toSeconds();
+}
+
+fn nextReviewAt(store: *const models.VocabularyStore) ?i64 {
+    var result: ?i64 = null;
+    for (store.entries.items) |entry| {
+        if (result) |current| {
+            result = @min(current, entry.next_review_at);
+        } else {
+            result = entry.next_review_at;
+        }
+    }
+    return result;
+}
+
+fn applyReviewResult(entry: *models.Vocab, was_correct: bool, now_ts: i64) void {
+    entry.total_reviews += 1;
+    entry.last_reviewed_at = now_ts;
+
+    if (was_correct) {
+        entry.correct_reviews += 1;
+        entry.review_streak += 1;
+        entry.interval_seconds = nextIntervalSeconds(entry.review_streak, entry.interval_seconds);
+    } else {
+        entry.review_streak = 0;
+        entry.interval_seconds = 10 * 60;
+    }
+
+    entry.next_review_at = now_ts + entry.interval_seconds;
+}
+
+fn nextIntervalSeconds(streak: u16, previous_interval: i64) i64 {
+    return switch (streak) {
+        1 => 4 * 60 * 60,
+        2 => 24 * 60 * 60,
+        3 => 3 * 24 * 60 * 60,
+        4 => 7 * 24 * 60 * 60,
+        5 => 14 * 24 * 60 * 60,
+        else => @min(if (previous_interval == 0) 30 * 24 * 60 * 60 else previous_interval * 2, 90 * 24 * 60 * 60),
+    };
+}
+
+fn duePriorityScore(entry: models.Vocab, now_ts: i64) i128 {
+    const overdue_seconds = @max(now_ts - entry.next_review_at, 0);
+    const overdue_minutes = @divTrunc(overdue_seconds, 60);
+    const streak_penalty = @as(i128, entry.review_streak) * 600;
+    const review_bonus: i128 = if (entry.total_reviews == 0) 20_000 else 0;
+    const accuracy_penalty = if (entry.total_reviews == 0)
+        0
+    else
+        @as(i128, @divTrunc(@as(i128, entry.correct_reviews) * 10_000, entry.total_reviews));
+    const short_interval_bonus: i128 = if (entry.interval_seconds == 0)
+        5_000
+    else
+        @as(i128, @divTrunc(7 * 24 * 60 * 60, @max(entry.interval_seconds, 1)));
+
+    return @as(i128, overdue_minutes) * 100 + review_bonus + short_interval_bonus - streak_penalty - accuracy_penalty;
 }
